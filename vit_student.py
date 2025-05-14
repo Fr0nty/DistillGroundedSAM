@@ -46,17 +46,21 @@ class TransformerBlock(nn.Module):
         return x
 
 class SmallViT(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=192, depth=4, num_heads=3):
+    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=192, depth=4, num_heads=3, actual_output_dim=None):
         super().__init__()
+        self.embed_dim = embed_dim
         self.patch_embed = PatchEmbedding(img_size, patch_size, in_channels, embed_dim)
         self.embedding = ViTEmbedding(self.patch_embed.num_patches, embed_dim)
         self.blocks = nn.Sequential(*[TransformerBlock(embed_dim, num_heads) for _ in range(depth)])
         self.norm = nn.LayerNorm(embed_dim)
         self.head = nn.Identity()
+        self.actual_output_dim = actual_output_dim
+        self.final_proj = nn.Linear(actual_output_dim, embed_dim)
 
     def forward(self, x):
         x = self.patch_embed(x)
         x = self.embedding(x)
         x = self.blocks(x)
         x = self.norm(x)
+        x = self.final_proj(x)
         return self.head(x[:, 0])  # CLS token
