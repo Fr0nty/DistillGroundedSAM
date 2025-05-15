@@ -24,6 +24,7 @@ def main():
     student_dim = 192
     teacher_dim = 768
     project_to_teacher_dim = True
+    
     # ----------------------------
 
     # ---------- Transforms ----------
@@ -55,6 +56,7 @@ def main():
         dummy_input = torch.randn(1, 3, img_size, img_size).to(device)
         dummy_output = student(dummy_input)
         print("Shape of student output:", dummy_output.shape)
+    
     projection = nn.Linear(actual_output_dim, teacher_dim) if project_to_teacher_dim else nn.Identity().to(device)
     optimizer = optim.Adam(list(student.parameters()) + list(projection.parameters()), lr=learning_rate)
     # -----------------------------------
