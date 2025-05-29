@@ -8,6 +8,12 @@ import torch.nn as nn
 import torch.optim as optim
 from data.hf_cifar import get_cifar_dataloader
 
+def get_actual_output_dim(teacher, img_size, device):
+    with torch.no_grad():
+        dummy_input = torch.randn(1, 3, img_size, img_size).to(device)
+        actual_output = teacher(dummy_input)
+        return actual_output.shape[-1]
+
 def main():
     # ---------- Config ----------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -30,8 +36,8 @@ def main():
     # -------------------------------
 
     # ---------- Datasets ----------
-    train_loader = get_cifar_dataloader(split="train[:10%]", batch_size=batch_size )
-    val_loader = get_cifar_dataloader(split="test[:10%]", batch_size=batch_size, shuffle=False )
+    train_loader = get_cifar_dataloader(split="train[:10%]", batch_size=batch_size)
+    val_loader = get_cifar_dataloader(split="test[:10%]", batch_size=batch_size, shuffle=False)
     # -------------------------------
 
     # ---------- Teacher Model ----------
@@ -41,14 +47,16 @@ def main():
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
+    actual_output_dim = get_actual_output_dim(teacher, img_size, device)
     # -----------------------------------
 
     # ---------- Student Model ----------
-    student = SmallViT(embed_dim=student_dim).to(device)
+    student = SmallViT(embed_dim=student_dim, actual_output_dim=actual_output_dim).to(device)
     with torch.no_grad():
-        dummy_input = torch.randn(1, 3, img_size, img_size).to(device)  # Simulates a single image
+        dummy_input = torch.randn(1, 3, img_size, img_size).to(device)
         dummy_output = student(dummy_input)
         print("Shape of student output:", dummy_output.shape)
+    
     projection = nn.Linear(actual_output_dim, teacher_dim) if project_to_teacher_dim else nn.Identity().to(device)
     optimizer = optim.Adam(list(student.parameters()) + list(projection.parameters()), lr=learning_rate)
     # -----------------------------------
@@ -66,7 +74,7 @@ def main():
                 teacher_out = teacher(images)  # shape: [B, D_teacher]
 
             # Forward through student
-            student_out = student(images)     # expected shape: [B, N, D_student]
+            student_out = student(images)     # expected shape: [B, D_student]
             student_out = student_out.mean(dim=1)  # global average pooling over sequence (N) → [B, D_student]
             student_out = projection(student_out)  # shape: [B, D_teacher]
 
