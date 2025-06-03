@@ -28,7 +28,7 @@ except ImportError:
         print("UMAP visualizations will be skipped.")
 
 # Import your models (assuming they're in the same directory or installed)
-from batchdistill import StudentViT, DINOv2Teacher, DINOv2Distiller
+from batchdistill import StudentViT, DINOv2Teacher, EnhancedDINOv2Distiller
 
 class DistillationEvaluator:
     """Comprehensive evaluation and visualization for distilled models"""
@@ -542,7 +542,7 @@ def main():
     
     # Initialize evaluator
     evaluator = DistillationEvaluator(
-        student_model_path="dinov2_student_cifar10.pth",  # Path to your trained model
+        student_model_path="enhanced_dinov2_student_cifar10.pth",  # Path to your trained model
         student_config=student_config,
         teacher_model_name="facebook/dinov2-small",
         save_dir="evaluation_results"
