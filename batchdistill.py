@@ -745,15 +745,16 @@ class EnhancedDINOv2Distiller:
 # Enhanced usage example
 def main():
     from data.hf_cifar import get_cifar_dataloader
+    from data.multiple_datasets import get_food101_dataloader
     
     # Get dataloaders
-    train_loader = get_cifar_dataloader(
+    train_loader = get_food101_dataloader(
         split="train[:80%]",
         batch_size=32,
         shuffle=True
     )
     
-    val_loader = get_cifar_dataloader(
+    val_loader = get_food101_dataloader(
         split="train[80%:]",
         batch_size=32,
         shuffle=False
@@ -788,7 +789,7 @@ def main():
         train_dataloader=train_loader,
         val_dataloader=val_loader,
         num_epochs=50,
-        save_path="enhanced_dinov2_student_cifar10.pth"
+        save_path="enhanced_dinov2_student_food101.pth"
     )
     
     print("Enhanced training completed!")

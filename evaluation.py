@@ -532,9 +532,9 @@ def main():
     
     # Import your dataloader
     from data.hf_cifar import get_cifar_dataloader  # Replace with your actual import
-    
+    from data.multiple_datasets import get_food101_dataloader
     # Get test dataloader
-    test_loader = get_cifar_dataloader(
+    test_loader = get_food101_dataloader(
         split="test",  # or "train[90%:]" for a held-out set
         batch_size=64,
         shuffle=False
@@ -542,7 +542,7 @@ def main():
     
     # Initialize evaluator
     evaluator = DistillationEvaluator(
-        student_model_path="enhanced_dinov2_student_cifar10.pth",  # Path to your trained model
+        student_model_path="enhanced_dinov2_student_food101.pth",  # Path to your trained model
         student_config=student_config,
         teacher_model_name="facebook/dinov2-small",
         save_dir="evaluation_results"
