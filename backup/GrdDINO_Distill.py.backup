@@ -1,0 +1,991 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, ReduceLROnPlateau
+from torch.cuda.amp import autocast, GradScaler
+import timm
+import numpy as np
+import os
+import json
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional, Callable
+import warnings
+from dataclasses import dataclass
+from tqdm import tqdm
+import pickle
+warnings.filterwarnings("ignore")
+
+try:
+    # Try importing GroundingDINO
+    from groundingdino.models import build_model
+    from groundingdino.util.slconfig import SLConfig
+    from groundingdino.util.utils import clean_state_dict
+    from groundingdino.util import box_ops
+    GROUNDING_DINO_AVAILABLE = True
+    print("GroundingDINO available!")
+except ImportError:
+    print("GroundingDINO not found. Install with: pip install groundingdino-py")
+    GROUNDING_DINO_AVAILABLE = False
+
+try:
+    from transformers import AutoProcessor, AutoModel
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+
+
+@dataclass
+class DistillationConfig:
+    """Complete configuration for distillation training."""
+    
+    # Dataset settings
+    dataset_name: str
+    num_classes: int
+    loader_function: Callable
+    train_split: str
+    val_split: str
+    batch_size: int = 16
+    img_size: int = 224
+    num_workers: int = 4
+    dataset_kwargs: Dict = None
+    
+    # Student model settings
+    student_type: str = "vit"  # "vit", "mae", "deit", "swin", "convnext"
+    student_model: str = "vit_base_patch16_224"
+    
+    # Training settings
+    num_epochs: int = 20
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
+    scheduler_type: str = "cosine"  # "cosine", "step", "plateau"
+    
+    # Distillation loss weights
+    temperature: float = 4.0
+    alpha: float = 0.7  # Feature distillation
+    beta: float = 0.3   # Attention distillation
+    gamma: float = 1.0  # Task loss
+    
+    # Checkpointing
+    save_every: int = 5  # Save checkpoint every N epochs
+    resume_from: Optional[str] = None
+    experiment_name: str = "grounding_dino_distill"
+    
+    # Device
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+class GroundingDINOTeacher(nn.Module):
+    """
+    GroundingDINO teacher model for knowledge distillation with CUDA safety.
+    """
+    def __init__(self, 
+                 config_path: str = None,
+                 checkpoint_path: str = None,
+                 device: str = 'cuda'):
+        super().__init__()
+        
+        # CUDA Fix: Safe device initialization
+        if device == 'cuda' and not torch.cuda.is_available():
+            print("CUDA requested but not available, falling back to CPU")
+            device = 'cpu'
+        
+        self.device = torch.device(device)
+        print(f"Teacher device: {self.device}")
+        
+        # Initialize with error handling
+        self.model = None
+        self.processor = None
+        
+        try:
+            if GROUNDING_DINO_AVAILABLE:
+                self._init_grounding_dino(config_path, checkpoint_path)
+            else:
+                self._init_fallback_model()
+        except Exception as e:
+            print(f"Teacher initialization failed: {e}")
+            print("Falling back to DINO teacher...")
+            self._init_fallback_model()
+        
+        # CUDA Fix: Ensure model is on correct device AFTER initialization
+        if self.model is not None:
+            try:
+                self.model = self.model.to(self.device)
+                print(f"Teacher model moved to {self.device}")
+            except Exception as e:
+                print(f"Failed to move teacher to device: {e}")
+                # Force CPU if GPU fails
+                self.device = torch.device('cpu')
+                self.model = self.model.to(self.device)
+                print("Forced teacher to CPU")
+        
+        # Freeze all parameters
+        if self.model is not None:
+            for param in self.model.parameters():
+                param.requires_grad = False
+        
+        # Feature extraction hooks
+        self.features = {}
+        self.attention_weights = {}
+        self._register_hooks()
+    
+    def _init_grounding_dino(self, config_path=None, checkpoint_path=None):
+        """CUDA-safe GroundingDINO initialization."""
+        try:
+            # Default paths if not provided
+            if config_path is None:
+                config_path = "groundingdino/config/GroundingDINO_SwinT_OGC.py"
+            if checkpoint_path is None:
+                checkpoint_path = "groundingdino_swint_ogc.pth"
+            
+            # Load config with device specification
+            if os.path.exists(config_path):
+                args = SLConfig.fromfile(config_path)
+            else:
+                print(f"Config not found: {config_path}, using minimal config")
+                args = self._create_minimal_config()
+            
+            # Force device in config
+            args.device = str(self.device)
+            
+            # CUDA Fix: Build model with device context
+            with torch.cuda.device(self.device) if self.device.type == 'cuda' else torch.no_grad():
+                self.model, _, _ = build_model(args)
+            
+            # CUDA Fix: Load checkpoint with proper map_location
+            if os.path.exists(checkpoint_path):
+                print(f"Loading checkpoint: {checkpoint_path}")
+                checkpoint = torch.load(
+                    checkpoint_path, 
+                    map_location=self.device  # Critical: map to correct device
+                )
+                
+                # Clean and load state dict
+                if 'model' in checkpoint:
+                    state_dict = clean_state_dict(checkpoint['model'])
+                else:
+                    state_dict = clean_state_dict(checkpoint)
+                
+                # Handle state dict loading errors gracefully
+                try:
+                    self.model.load_state_dict(state_dict, strict=False)
+                    print("Checkpoint loaded successfully")
+                except Exception as e:
+                    print(f"Partial checkpoint loading: {e}")
+                    # Try loading without strict mode
+                    missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+                    print(f"Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
+            else:
+                print(f"Checkpoint not found: {checkpoint_path}")
+            
+            self.model.eval()
+            print("GroundingDINO teacher initialized successfully")
+            
+        except Exception as e:
+            print(f"GroundingDINO initialization failed: {e}")
+            raise e
+    
+    def _create_minimal_config(self):
+        """Create minimal config for GroundingDINO."""
+        class MinimalConfig:
+            def __init__(self):
+                self.device = 'cuda'
+                self.hidden_dim = 256
+                self.nheads = 8
+                self.num_encoder_layers = 6
+                self.num_decoder_layers = 6
+        
+        return MinimalConfig()
+    
+    def _init_fallback_model(self):
+        """CUDA-safe fallback model initialization."""
+        try:
+            # Try HuggingFace first
+            if HF_AVAILABLE:
+                print("Trying HuggingFace GroundingDINO...")
+                
+                self.processor = AutoProcessor.from_pretrained("IDEA-Research/grounding-dino-base")
+                self.model = AutoModel.from_pretrained(
+                    "IDEA-Research/grounding-dino-base",
+                    torch_dtype=torch.float16 if self.device.type == 'cuda' else torch.float32
+                )
+                
+                self.model.eval()
+                print("HuggingFace GroundingDINO loaded")
+                return
+        except Exception as e:
+            print(f"HuggingFace fallback failed: {e}")
+        
+        # Final fallback to DINO
+        print("Using DINO as final fallback...")
+        self.model = timm.create_model("vit_base_patch16_224.dino", pretrained=True, num_classes=0)
+        self.processor = None
+        print("DINO fallback loaded")
+    
+    def _register_hooks(self):
+        """CUDA-safe hook registration."""
+        if self.model is None:
+            return
+        
+        def get_features_hook(name):
+            def hook(module, input, output):
+                try:
+                    if isinstance(output, tuple):
+                        self.features[name] = output[0].detach()
+                    else:
+                        self.features[name] = output.detach()
+                except Exception as e:
+                    print(f"Hook error for {name}: {e}")
+            return hook
+        
+        def get_attention_hook(name):
+            def hook(module, input, output):
+                try:
+                    if isinstance(output, tuple) and len(output) > 1:
+                        self.attention_weights[name] = output[1].detach()
+                    elif hasattr(output, 'attentions'):
+                        self.attention_weights[name] = output.attentions.detach()
+                except Exception as e:
+                    print(f"Attention hook error for {name}: {e}")
+            return hook
+        
+        # Register hooks based on model architecture with error handling
+        try:
+            if hasattr(self.model, 'backbone'):  # GroundingDINO
+                backbone = self.model.backbone
+                if hasattr(backbone, 'layers'):
+                    for i, layer in enumerate(backbone.layers):
+                        layer.register_forward_hook(get_features_hook(f'backbone_layer_{i}'))
+                        if hasattr(layer, 'attn'):
+                            layer.attn.register_forward_hook(get_attention_hook(f'backbone_attn_{i}'))
+            elif hasattr(self.model, 'blocks'):  # ViT/DINO fallback
+                for i, block in enumerate(self.model.blocks):
+                    block.register_forward_hook(get_features_hook(f'teacher_block_{i}'))
+                    if hasattr(block, 'attn'):
+                        block.attn.register_forward_hook(get_attention_hook(f'teacher_attn_{i}'))
+        except Exception as e:
+            print(f"Hook registration failed: {e}")
+    
+    def forward(self, images: torch.Tensor, text_queries: List[str] = None) -> Dict[str, torch.Tensor]:
+        """CUDA-safe forward pass through GroundingDINO teacher."""
+        if text_queries is None:
+            text_queries = ["object"] * images.size(0)
+        
+        # CUDA Fix: Ensure input tensors are on correct device
+        if images.device != self.device:
+            print(f"Moving images from {images.device} to {self.device}")
+            images = images.to(self.device)
+        
+        self.features.clear()
+        self.attention_weights.clear()
+        
+        try:
+            with torch.no_grad():
+                if hasattr(self, 'processor') and self.processor is not None:
+                    # HuggingFace GroundingDINO
+                    inputs = self.processor(images=images, text=text_queries, return_tensors="pt")
+                    # CUDA Fix: Move all inputs to device
+                    inputs = {k: v.to(self.device) if torch.is_tensor(v) else v 
+                             for k, v in inputs.items()}
+                    outputs = self.model(**inputs)
+                    
+                elif hasattr(self.model, 'backbone'):
+                    # Native GroundingDINO
+                    captions = text_queries
+                    targets = [{"boxes": torch.empty(0, 4), "labels": torch.empty(0, dtype=torch.long)} 
+                              for _ in range(len(images))]
+                    
+                    outputs = self.model(images, captions)
+                    
+                else:
+                    # Fallback model
+                    outputs = self.model.forward_features(images) if hasattr(self.model, 'forward_features') else self.model(images)
+                    
+        except RuntimeError as e:
+            if "CUDA" in str(e) or "device" in str(e):
+                print(f"CUDA error in forward pass: {e}")
+                print("Emergency CPU fallback...")
+                
+                # Emergency CPU fallback
+                self.device = torch.device('cpu')
+                self.model = self.model.to(self.device)
+                images = images.to(self.device)
+                
+                # Retry on CPU
+                return self.forward(images, text_queries)
+            else:
+                raise e
+        
+        # Extract features safely
+        extracted_features = {}
+        for name, feat in self.features.items():
+            try:
+                extracted_features[name] = feat
+            except Exception as e:
+                print(f"Feature extraction error for {name}: {e}")
+        
+        return {
+            'features': extracted_features,
+            'attention': self.attention_weights.copy(),
+            'outputs': outputs
+        }
+
+
+class MultiStudentArchitecture(nn.Module):
+    """
+    Flexible student architecture supporting multiple model types.
+    """
+    def __init__(self, 
+                 student_type: str = "vit",
+                 model_name: str = "vit_base_patch16_224",
+                 num_classes: int = 10,
+                 pretrained: bool = True):
+        super().__init__()
+        
+        self.student_type = student_type.lower()
+        self.num_classes = num_classes
+        
+        # Initialize the backbone based on student type
+        if self.student_type == "mae":
+            self._init_mae_student(model_name, pretrained)
+        elif self.student_type == "deit":
+            self._init_deit_student(model_name, pretrained)
+        elif self.student_type == "swin":
+            self._init_swin_student(model_name, pretrained)
+        elif self.student_type == "convnext":
+            self._init_convnext_student(model_name, pretrained)
+        else:  # Default to ViT
+            self._init_vit_student(model_name, pretrained)
+        
+        # Feature projection layers for distillation
+        self.feature_projectors = self._build_projectors()
+        
+        # Store intermediate features
+        self.student_features = {}
+        self.student_attentions = {}
+        self._register_hooks()
+    
+    def _init_vit_student(self, model_name, pretrained):
+        """Initialize Vision Transformer student."""
+        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        self.hidden_dim = self.backbone.embed_dim
+        self.classifier = nn.Linear(self.hidden_dim, self.num_classes)
+        print(f"Initialized ViT student: {model_name}")
+    
+    def _init_mae_student(self, model_name, pretrained):
+        """Initialize MAE (Masked Autoencoder) student."""
+        # MAE models in timm
+        mae_models = {
+            "mae_base": "vit_base_patch16_224.mae",
+            "mae_large": "vit_large_patch16_224.mae", 
+            "mae_huge": "vit_huge_patch14_224.mae"
+        }
+        
+        actual_model = mae_models.get(model_name, "vit_base_patch16_224.mae")
+        self.backbone = timm.create_model(actual_model, pretrained=pretrained, num_classes=0)
+        self.hidden_dim = self.backbone.embed_dim
+        self.classifier = nn.Linear(self.hidden_dim, self.num_classes)
+        print(f"Initialized MAE student: {actual_model}")
+    
+    def _init_deit_student(self, model_name, pretrained):
+        """Initialize DeiT student."""
+        deit_models = {
+            "deit_base": "deit_base_patch16_224",
+            "deit_small": "deit_small_patch16_224",
+            "deit_tiny": "deit_tiny_patch16_224"
+        }
+        
+        actual_model = deit_models.get(model_name, "deit_base_patch16_224")
+        self.backbone = timm.create_model(actual_model, pretrained=pretrained, num_classes=0)
+        self.hidden_dim = self.backbone.embed_dim
+        self.classifier = nn.Linear(self.hidden_dim, self.num_classes)
+        print(f"Initialized DeiT student: {actual_model}")
+    
+    def _init_swin_student(self, model_name, pretrained):
+        """Initialize Swin Transformer student."""
+        swin_models = {
+            "swin_base": "swin_base_patch4_window7_224",
+            "swin_small": "swin_small_patch4_window7_224",
+            "swin_tiny": "swin_tiny_patch4_window7_224"
+        }
+        
+        actual_model = swin_models.get(model_name, "swin_base_patch4_window7_224")
+        self.backbone = timm.create_model(actual_model, pretrained=pretrained, num_classes=0)
+        self.hidden_dim = self.backbone.num_features
+        self.classifier = nn.Linear(self.hidden_dim, self.num_classes)
+        print(f"Initialized Swin student: {actual_model}")
+    
+    def _init_convnext_student(self, model_name, pretrained):
+        """Initialize ConvNeXt student."""
+        convnext_models = {
+            "convnext_base": "convnext_base",
+            "convnext_small": "convnext_small",
+            "convnext_tiny": "convnext_tiny"
+        }
+        
+        actual_model = convnext_models.get(model_name, "convnext_base")
+        self.backbone = timm.create_model(actual_model, pretrained=pretrained, num_classes=0)
+        self.hidden_dim = self.backbone.num_features
+        self.classifier = nn.Linear(self.hidden_dim, self.num_classes)
+        print(f"Initialized ConvNeXt student: {actual_model}")
+    
+    def _build_projectors(self):
+        """Build feature projection layers for knowledge distillation."""
+        projectors = nn.ModuleDict()
+        
+        # Teacher feature dimensions (GroundingDINO typically uses these)
+        teacher_dims = [256, 512, 768, 1024]  # Common GroundingDINO dimensions
+        
+        for i, teacher_dim in enumerate(teacher_dims):
+            projectors[f'layer_{i}'] = nn.Sequential(
+                nn.Linear(self.hidden_dim, teacher_dim),
+                nn.LayerNorm(teacher_dim),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(teacher_dim, teacher_dim)
+            )
+        
+        return projectors
+    
+    def _register_hooks(self):
+        """Register hooks for feature extraction."""
+        def get_features_hook(name):
+            def hook(module, input, output):
+                if isinstance(output, tuple):
+                    self.student_features[name] = output[0]
+                else:
+                    self.student_features[name] = output
+            return hook
+        
+        def get_attention_hook(name):
+            def hook(module, input, output):
+                if isinstance(output, tuple) and len(output) > 1:
+                    self.student_attentions[name] = output[1]
+            return hook
+        
+        # Register hooks based on architecture
+        if hasattr(self.backbone, 'blocks'):  # ViT-like models
+            for i, block in enumerate(self.backbone.blocks):
+                block.register_forward_hook(get_features_hook(f'student_block_{i}'))
+                if hasattr(block, 'attn'):
+                    block.attn.register_forward_hook(get_attention_hook(f'student_attn_{i}'))
+        elif hasattr(self.backbone, 'layers'):  # Swin-like models
+            for i, layer in enumerate(self.backbone.layers):
+                layer.register_forward_hook(get_features_hook(f'student_layer_{i}'))
+        elif hasattr(self.backbone, 'stages'):  # ConvNeXt-like models
+            for i, stage in enumerate(self.backbone.stages):
+                stage.register_forward_hook(get_features_hook(f'student_stage_{i}'))
+    
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Forward pass through student model."""
+        self.student_features.clear()
+        self.student_attentions.clear()
+        
+        # Forward through backbone
+        if hasattr(self.backbone, 'forward_features'):
+            features = self.backbone.forward_features(x)
+        else:
+            features = self.backbone(x)
+        
+        # Handle different output formats
+        if isinstance(features, tuple):
+            features = features[0]
+        
+        # Global pooling for classification
+        if features.dim() == 3:  # [B, N, D] format (ViT-like)
+            cls_features = features[:, 0] if features.size(1) > 1 else features.mean(dim=1)
+        else:  # [B, D] format or [B, C, H, W]
+            if features.dim() == 4:  # [B, C, H, W]
+                cls_features = F.adaptive_avg_pool2d(features, (1, 1)).flatten(1)
+            else:
+                cls_features = features
+        
+        # Classification
+        logits = self.classifier(cls_features)
+        
+        return {
+            'logits': logits,
+            'cls_features': cls_features,
+            'raw_features': features,
+            'features': self.student_features.copy(),
+            'attention': self.student_attentions.copy()
+        }
+
+
+class AdvancedDistillationLoss(nn.Module):
+    """Advanced knowledge distillation loss with multiple objectives."""
+    
+    def __init__(self, config: DistillationConfig):
+        super().__init__()
+        self.temperature = config.temperature
+        self.alpha = config.alpha
+        self.beta = config.beta
+        self.gamma = config.gamma
+        
+        self.kl_div = nn.KLDivLoss(reduction='batchmean')
+        self.mse_loss = nn.MSELoss()
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.cosine_loss = nn.CosineEmbeddingLoss()
+    
+    def feature_distillation_loss(self, student_features, teacher_features):
+        """Compute feature-level distillation loss."""
+        total_loss = 0.0
+        count = 0
+        
+        for s_name, s_feat in student_features.items():
+            for t_name, t_feat in teacher_features.items():
+                if self._features_compatible(s_feat, t_feat):
+                    loss = self._compute_feature_loss(s_feat, t_feat)
+                    total_loss += loss
+                    count += 1
+        
+        return total_loss / max(count, 1)
+    
+    def attention_distillation_loss(self, student_attention, teacher_attention):
+        """Compute attention transfer loss."""
+        total_loss = 0.0
+        count = 0
+        
+        for s_name, s_attn in student_attention.items():
+            for t_name, t_attn in teacher_attention.items():
+                if s_attn is not None and t_attn is not None:
+                    loss = self._compute_attention_loss(s_attn, t_attn)
+                    total_loss += loss
+                    count += 1
+        
+        return total_loss / max(count, 1)
+    
+    def _features_compatible(self, s_feat, t_feat):
+        """Check if student and teacher features are compatible."""
+        if s_feat is None or t_feat is None:
+            return False
+        if s_feat.dim() != t_feat.dim():
+            return False
+        return True
+    
+    def _compute_feature_loss(self, s_feat, t_feat):
+        """Compute loss between student and teacher features."""
+        # Align dimensions
+        if s_feat.dim() == 3:  # [B, N, D]
+            min_seq = min(s_feat.size(1), t_feat.size(1))
+            s_aligned = s_feat[:, :min_seq]
+            t_aligned = t_feat[:, :min_seq]
+        else:
+            s_aligned = s_feat
+            t_aligned = t_feat
+        
+        # Dimension alignment
+        if s_aligned.size(-1) != t_aligned.size(-1):
+            # Project to common dimension
+            common_dim = min(s_aligned.size(-1), t_aligned.size(-1))
+            s_aligned = F.linear(s_aligned, torch.randn(common_dim, s_aligned.size(-1)).to(s_aligned.device))
+            t_aligned = F.linear(t_aligned, torch.randn(common_dim, t_aligned.size(-1)).to(t_aligned.device))
+        
+        # Compute MSE loss
+        return self.mse_loss(s_aligned, t_aligned.detach())
+    
+    def _compute_attention_loss(self, s_attn, t_attn):
+        """Compute attention transfer loss."""
+        # Flatten attention maps
+        s_flat = s_attn.flatten(2)
+        t_flat = t_attn.flatten(2)
+        
+        # Align dimensions
+        min_heads = min(s_flat.size(1), t_flat.size(1))
+        min_tokens = min(s_flat.size(2), t_flat.size(2))
+        
+        s_aligned = s_flat[:, :min_heads, :min_tokens]
+        t_aligned = t_flat[:, :min_heads, :min_tokens]
+        
+        # Normalize and compute KL divergence
+        s_norm = F.log_softmax(s_aligned / self.temperature, dim=-1)
+        t_norm = F.softmax(t_aligned / self.temperature, dim=-1)
+        
+        return self.kl_div(s_norm, t_norm)
+    
+    def forward(self, student_outputs, teacher_outputs, labels):
+        """Compute total distillation loss."""
+        # Task loss
+        task_loss = self.ce_loss(student_outputs['logits'], labels)
+        
+        # Feature distillation
+        feat_loss = self.feature_distillation_loss(
+            student_outputs['features'], 
+            teacher_outputs['features']
+        )
+        
+        # Attention distillation
+        attn_loss = self.attention_distillation_loss(
+            student_outputs['attention'],
+            teacher_outputs['attention']
+        )
+        
+        # Total loss
+        total_loss = (self.gamma * task_loss + 
+                     self.alpha * feat_loss + 
+                     self.beta * attn_loss)
+        
+        return {
+            'total_loss': total_loss,
+            'task_loss': task_loss,
+            'feature_loss': feat_loss,
+            'attention_loss': attn_loss
+        }
+
+
+class GroundingDINODistillationTrainer:
+    """
+    Advanced trainer for GroundingDINO → Student distillation with CUDA safety.
+    """
+    def __init__(self, config: DistillationConfig):
+        self.config = config
+        self.device = torch.device(config.device)
+        
+        # Create experiment directory
+        self.exp_dir = f"experiments/{config.experiment_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.makedirs(self.exp_dir, exist_ok=True)
+        
+        # Save config
+        with open(f"{self.exp_dir}/config.json", 'w') as f:
+            # Convert config to dict for JSON serialization
+            config_dict = {
+                'dataset_name': config.dataset_name,
+                'num_classes': config.num_classes,
+                'student_type': config.student_type,
+                'student_model': config.student_model,
+                'num_epochs': config.num_epochs,
+                'learning_rate': config.learning_rate,
+                'batch_size': config.batch_size,
+                'temperature': config.temperature,
+                'alpha': config.alpha,
+                'beta': config.beta,
+                'gamma': config.gamma
+            }
+            json.dump(config_dict, f, indent=2)
+        
+        # Initialize models
+        print("Initializing GroundingDINO teacher...")
+        self.teacher = GroundingDINOTeacher(device=str(self.device))
+        
+        print(f"Initializing {config.student_type.upper()} student...")
+        self.student = MultiStudentArchitecture(
+            student_type=config.student_type,
+            model_name=config.student_model,
+            num_classes=config.num_classes
+        ).to(self.device)
+        
+        # Initialize loss and optimizer
+        self.criterion = AdvancedDistillationLoss(config).to(self.device)
+        self.optimizer = AdamW(
+            self.student.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay
+        )
+        
+        # Initialize scheduler
+        self.scheduler = self._create_scheduler()
+        
+        # Mixed precision training
+        self.scaler = GradScaler()
+        
+        # Training state
+        self.current_epoch = 0
+        self.best_val_acc = 0.0
+        self.training_history = {
+            'train_loss': [], 'task_loss': [], 'feature_loss': [], 'attention_loss': [],
+            'val_loss': [], 'val_accuracy': [], 'learning_rates': []
+        }
+        
+        # Load checkpoint if specified
+        if config.resume_from:
+            self.load_checkpoint(config.resume_from)
+        
+        # Create data loaders
+        self._create_data_loaders()
+    
+    def _create_scheduler(self):
+        """Create learning rate scheduler."""
+        if self.config.scheduler_type == "cosine":
+            return CosineAnnealingLR(self.optimizer, T_max=self.config.num_epochs)
+        elif self.config.scheduler_type == "step":
+            return StepLR(self.optimizer, step_size=10, gamma=0.1)
+        elif self.config.scheduler_type == "plateau":
+            return ReduceLROnPlateau(self.optimizer, mode='max', patience=5)
+        else:
+            return None
+    
+    def _create_data_loaders(self):
+        """Create data loaders based on configuration."""
+        print(f"Loading {self.config.dataset_name} dataset...")
+        
+        kwargs = self.config.dataset_kwargs or {}
+        
+        self.train_loader = self.config.loader_function(
+            split=self.config.train_split,
+            batch_size=self.config.batch_size,
+            img_size=self.config.img_size,
+            shuffle=True,
+            num_workers=self.config.num_workers,
+            **kwargs
+        )
+        
+        self.val_loader = self.config.loader_function(
+            split=self.config.val_split,
+            batch_size=self.config.batch_size,
+            img_size=self.config.img_size,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+            **kwargs
+        )
+        
+        print(f"Train batches: {len(self.train_loader)}")
+        print(f"Val batches: {len(self.val_loader)}")
+    
+    def safe_batch_to_device(self, batch):
+        """Safely move batch to device."""
+        if isinstance(batch, (list, tuple)):
+            return [self.safe_batch_to_device(item) for item in batch]
+        elif torch.is_tensor(batch):
+            try:
+                return batch.to(self.device, non_blocking=True)
+            except RuntimeError as e:
+                print(f"Failed to move tensor to {self.device}: {e}")
+                return batch.cpu()
+        else:
+            return batch
+    
+    def safe_gradient_clip(self, max_norm=1.0):
+        """Safe gradient clipping with device awareness."""
+        try:
+            total_norm = torch.nn.utils.clip_grad_norm_(self.student.parameters(), max_norm)
+            return total_norm
+        except RuntimeError as e:
+            if "CUDA" in str(e):
+                print(f"Gradient clipping CUDA error: {e}")
+                # Try moving gradients to CPU temporarily
+                for param in self.student.parameters():
+                    if param.grad is not None:
+                        param.grad = param.grad.cpu()
+                total_norm = torch.nn.utils.clip_grad_norm_(self.student.parameters(), max_norm)
+                return total_norm
+            else:
+                raise e
+    
+    def train_epoch(self):
+        """Train for one epoch with progress bar and CUDA safety."""
+        self.student.train()
+        self.teacher.eval()
+        
+        epoch_losses = {'total_loss': 0.0, 'task_loss': 0.0, 'feature_loss': 0.0, 'attention_loss': 0.0}
+        num_batches = 0
+        
+        pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch + 1}")
+        
+        for batch_idx, (images, labels) in enumerate(pbar):
+            # CUDA Fix: Safe batch transfer
+            images = self.safe_batch_to_device(images)
+            labels = self.safe_batch_to_device(labels)
+            
+            # Mixed precision training
+            with autocast():
+                # Teacher forward
+                with torch.no_grad():
+                    teacher_outputs = self.teacher(images)
+                
+                # Student forward
+                student_outputs = self.student(images)
+                
+                # Compute loss
+                losses = self.criterion(student_outputs, teacher_outputs, labels)
+            
+            # Backward pass with gradient scaling
+            self.optimizer.zero_grad()
+            self.scaler.scale(losses['total_loss']).backward()
+            
+            # Gradient clipping
+            self.scaler.unscale_(self.optimizer)
+            self.safe_gradient_clip(max_norm=1.0)
+            
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            
+            # Update metrics
+            for key in epoch_losses:
+                loss_value = losses[key]
+                if torch.is_tensor(loss_value):
+                    epoch_losses[key] += loss_value.item()
+                else:
+                    epoch_losses[key] += float(loss_value)
+            num_batches += 1
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'Loss': f"{losses['total_loss'].item() if torch.is_tensor(losses['total_loss']) else losses['total_loss']:.4f}",
+                'Task': f"{losses['task_loss'].item() if torch.is_tensor(losses['task_loss']) else losses['task_loss']:.4f}",
+                'Feat': f"{losses['feature_loss'].item() if torch.is_tensor(losses['feature_loss']) else losses['feature_loss']:.4f}"
+            })
+            
+            # Clear CUDA cache periodically
+            if batch_idx % 50 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Average losses
+        avg_losses = {k: v / num_batches for k, v in epoch_losses.items()}
+        return avg_losses
+    
+    def evaluate(self):
+        """Evaluate on validation set."""
+        self.student.eval()
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for images, labels in tqdm(self.val_loader, desc="Validating"):
+                images = self.safe_batch_to_device(images)
+                labels = self.safe_batch_to_device(labels)
+                
+                student_outputs = self.student(images)
+                
+                loss = F.cross_entropy(student_outputs['logits'], labels)
+                total_loss += loss.item()
+                
+                _, predicted = torch.max(student_outputs['logits'], 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        
+        return {
+            'val_loss': total_loss / len(self.val_loader),
+            'val_accuracy': 100.0 * correct / total
+        }
+    
+    def save_checkpoint(self, filename):
+        """Save training checkpoint."""
+        checkpoint = {
+            'epoch': self.current_epoch,
+            'student_state_dict': self.student.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+            'scaler_state_dict': self.scaler.state_dict(),
+            'best_val_acc': self.best_val_acc,
+            'training_history': self.training_history,
+            'config': self.config
+        }
+        
+        filepath = f"{self.exp_dir}/{filename}"
+        torch.save(checkpoint, filepath)
+        print(f"Checkpoint saved: {filepath}")
+    
+    def load_checkpoint(self, filepath):
+        """Load training checkpoint."""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        
+        self.student.load_state_dict(checkpoint['student_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        if checkpoint.get('scheduler_state_dict') and self.scheduler:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        if checkpoint.get('scaler_state_dict'):
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        
+        self.current_epoch = checkpoint['epoch']
+        self.best_val_acc = checkpoint['best_val_acc']
+        self.training_history = checkpoint['training_history']
+        
+        print(f"Checkpoint loaded: {filepath}")
+        print(f"Resuming from epoch {self.current_epoch + 1}")
+        print(f"Best validation accuracy: {self.best_val_acc:.2f}%")
+    
+    def train(self):
+        """Complete training loop with checkpointing."""
+        print(f"\nStarting GroundingDINO → {self.config.student_type.upper()} distillation")
+        print(f"Dataset: {self.config.dataset_name} ({self.config.num_classes} classes)")
+        print(f"Student: {self.config.student_type} ({self.config.student_model})")
+        print(f"Experiment: {self.exp_dir}")
+        print("=" * 80)
+        
+        for epoch in range(self.current_epoch, self.config.num_epochs):
+            self.current_epoch = epoch
+            
+            print(f"\nEpoch {epoch + 1}/{self.config.num_epochs}")
+            print("-" * 50)
+            
+            # Training
+            train_losses = self.train_epoch()
+            
+            # Validation
+            val_metrics = self.evaluate()
+            
+            # Update scheduler
+            if self.scheduler:
+                if isinstance(self.scheduler, ReduceLROnPlateau):
+                    self.scheduler.step(val_metrics['val_accuracy'])
+                else:
+                    self.scheduler.step()
+            
+            # Update history
+            self.training_history['train_loss'].append(train_losses['total_loss'])
+            self.training_history['task_loss'].append(train_losses['task_loss'])
+            self.training_history['feature_loss'].append(train_losses['feature_loss'])
+            self.training_history['attention_loss'].append(train_losses['attention_loss'])
+            self.training_history['val_loss'].append(val_metrics['val_loss'])
+            self.training_history['val_accuracy'].append(val_metrics['val_accuracy'])
+            self.training_history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
+            
+            # Print progress
+            print(f"Train Loss: {train_losses['total_loss']:.4f}")
+            print(f"   Task: {train_losses['task_loss']:.4f}")
+            print(f"   Feature: {train_losses['feature_loss']:.4f}")
+            print(f"   Attention: {train_losses['attention_loss']:.4f}")
+            print(f"Val Loss: {val_metrics['val_loss']:.4f}")
+            print(f"Val Accuracy: {val_metrics['val_accuracy']:.2f}%")
+            print(f"Learning Rate: {self.optimizer.param_groups[0]['lr']:.2e}")
+            
+            # Save best model
+            if val_metrics['val_accuracy'] > self.best_val_acc:
+                self.best_val_acc = val_metrics['val_accuracy']
+                self.save_checkpoint("best_model.pth")
+                print(f"New best model! Accuracy: {self.best_val_acc:.2f}%")
+            
+            # Regular checkpointing
+            if (epoch + 1) % self.config.save_every == 0:
+                self.save_checkpoint(f"checkpoint_epoch_{epoch + 1}.pth")
+            
+            # Clear CUDA cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Save final model and history
+        self.save_checkpoint("final_model.pth")
+        
+        # Save training history
+        with open(f"{self.exp_dir}/training_history.pkl", 'wb') as f:
+            pickle.dump(self.training_history, f)
+        
+        print(f"\nTraining completed!")
+        print(f"Best validation accuracy: {self.best_val_acc:.2f}%")
+        print(f"Results saved in: {self.exp_dir}")
+        
+        return self.training_history
+
+
+if __name__ == "__main__":
+    print("GroundingDINO Knowledge Distillation Framework")
+    print("=" * 60)
+    print("Features:")
+    print("  GroundingDINO teacher (with CUDA safety)")
+    print("  Multiple student architectures (ViT, MAE, DeiT, Swin, ConvNeXt)")
+    print("  Advanced checkpointing and resume capability")
+    print("  Comprehensive training tracking")
+    print("  Mixed precision training")
+    print("  CUDA error handling and CPU fallback")
+    print("=" * 60)
+    
+    if not GROUNDING_DINO_AVAILABLE:
+        print("\nSETUP REQUIRED:")
+        print("Install GroundingDINO for best results:")
+        print("  pip install groundingdino-py")
+        print("  OR")
+        print("  git clone https://github.com/IDEA-Research/GroundingDINO.git")
+        print("  cd GroundingDINO && pip install -e .")

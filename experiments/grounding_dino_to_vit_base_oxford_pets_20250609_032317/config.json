@@ -1,0 +1,13 @@
+{
+  "dataset_name": "Oxford Pets",
+  "num_classes": 37,
+  "student_type": "vit",
+  "student_model": "vit_base_patch16_224",
+  "num_epochs": 20,
+  "learning_rate": 0.0001,
+  "batch_size": 16,
+  "temperature": 3.5,
+  "alpha": 0.8,
+  "beta": 0.2,
+  "gamma": 1.0
+}
