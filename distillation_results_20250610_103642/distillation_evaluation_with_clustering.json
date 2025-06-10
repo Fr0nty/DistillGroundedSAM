@@ -1,0 +1,57 @@
+{
+  "teacher_stats": {
+    "mean": 0.20112599432468414,
+    "std": 0.9608770608901978,
+    "shape": [
+      80,
+      768
+    ]
+  },
+  "student_stats": {
+    "ViT_Student": {
+      "mean": 0.18292593955993652,
+      "std": 0.7764819264411926,
+      "shape": [
+        80,
+        512
+      ]
+    },
+    "MAE_Student": {
+      "mean": 0.18350659310817719,
+      "std": 0.7641413807868958,
+      "shape": [
+        80,
+        512
+      ]
+    }
+  },
+  "correlations": {
+    "ViT_Student": 0.7572812219847063,
+    "MAE_Student": 0.7621280301660117
+  },
+  "mse_losses": {
+    "ViT_Student": 0.41507306694984436,
+    "MAE_Student": 0.4071797728538513
+  },
+  "cosine_similarities": {
+    "ViT_Student": 0.7663861513137817,
+    "MAE_Student": 0.7710424065589905
+  },
+  "clustering_metrics": {
+    "teacher": {
+      "silhouette": 0.047496993094682693,
+      "ari": 0.07959156957716979,
+      "n_clusters": 10
+    },
+    "ViT_Student": {
+      "silhouette": 0.16880670189857483,
+      "ari": 0.05652245435104458,
+      "n_clusters": 10
+    },
+    "MAE_Student": {
+      "silhouette": 0.17812955379486084,
+      "ari": 0.030531337391018258,
+      "n_clusters": 10
+    }
+  }
+}
